@@ -1,0 +1,73 @@
+name: nifty-oi-tracker
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "test = sirf NSE access check | run = asli tracker"
+        default: "test"
+  schedule:
+    # GitHub cron UTC me hota hai (IST = UTC + 5:30)
+    - cron: "15 3 * * 1-5"   # 08:45 IST -> 12:30 tak (session 1)
+    - cron: "45 6 * * 1-5"   # 12:15 IST -> taiyari, 12:31 par handover, 15:42 tak (session 2)
+    # 2 hisse isliye ki GitHub ke ek job ki limit 6 ghante hai
+
+env:
+  TZ: Asia/Kolkata
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install requests pandas openpyxl matplotlib numpy
+
+      - name: Today's date
+        run: echo "D=$(date +%Y%m%d)" >> "$GITHUB_ENV"
+
+      # ---- TEST MODE: sirf dekhta hai ki GitHub se NSE khulta hai ya nahi ----
+      - name: NSE access test
+        if: github.event.inputs.mode == 'test'
+        run: python nse_to_excel.py --test
+
+      # ---- RUN MODE ----
+      # Session 2 jaldi (12:15) start hoke taiyar baithta hai, session 1 ka history-cache save hone ke baad (12:31) aage badhta hai
+      - name: Wait for session 1 handover (12:31 IST)
+        if: github.event.schedule == '45 6 * * 1-5'
+        run: |
+          target=$(date -d "12:31" +%s); now=$(date +%s)
+          if [ "$now" -lt "$target" ]; then sleep $((target-now)); fi
+
+      - name: Restore today's chart history
+        if: github.event.inputs.mode != 'test'
+        uses: actions/cache/restore@v4
+        with:
+          path: oi_history_*.pkl
+          key: hist-${{ env.D }}-${{ github.run_id }}
+          restore-keys: hist-${{ env.D }}-
+
+      - name: Run tracker
+        if: github.event.inputs.mode != 'test'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ github.event.schedule }}" = "15 3 * * 1-5" ]; then
+            python run_actions.py --until 12:30
+          else
+            python run_actions.py --until 15:42
+          fi
+
+      - name: Save today's chart history
+        if: github.event.inputs.mode != 'test' && always()
+        uses: actions/cache/save@v4
+        with:
+          path: oi_history_*.pkl
+          key: hist-${{ env.D }}-${{ github.run_id }}
