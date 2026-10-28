@@ -7,10 +7,16 @@ on:
         description: "test = sirf NSE access check | run = asli tracker"
         default: "test"
   schedule:
-    # GitHub cron UTC me hota hai (IST = UTC + 5:30)
-    - cron: "15 3 * * 1-5"   # 08:45 IST -> 12:30 tak (session 1)
-    - cron: "45 6 * * 1-5"   # 12:15 IST -> taiyari, 12:31 par handover, 15:42 tak (session 2)
-    # 2 hisse isliye ki GitHub ke ek job ki limit 6 ghante hai
+    # GitHub cron UTC me hota hai (IST = UTC + 5:30). GitHub scheduled runs ko 30-40 min late kar sakta hai,
+    # isliye har session ke liye jaldi wala + backup trigger hai (concurrency se ek hi chalta hai).
+    - cron: "37 2 * * 1-5"   # 08:07 IST  session 1 (13:30 tak)
+    - cron: "7 3 * * 1-5"    # 08:37 IST  session 1 backup
+    - cron: "37 6 * * 1-5"   # 12:07 IST  session 2 (13:32 par handover, 15:42 tak)
+    - cron: "7 7 * * 1-5"    # 12:37 IST  session 2 backup
+
+concurrency:
+  group: nifty-${{ (github.event.schedule == '37 2 * * 1-5' || github.event.schedule == '7 3 * * 1-5') && 'session1' || 'session2' }}
+  cancel-in-progress: false
 
 env:
   TZ: Asia/Kolkata
@@ -38,11 +44,11 @@ jobs:
         run: python nse_to_excel.py --test
 
       # ---- RUN MODE ----
-      # Session 2 jaldi (12:15) start hoke taiyar baithta hai, session 1 ka history-cache save hone ke baad (12:31) aage badhta hai
-      - name: Wait for session 1 handover (12:31 IST)
-        if: github.event.schedule == '45 6 * * 1-5'
+      # Session 2 jaldi start hoke taiyar baithta hai, session 1 ka history-cache save hone ke baad (13:32) aage badhta hai
+      - name: Wait for session 1 handover (13:32 IST)
+        if: github.event.schedule == '37 6 * * 1-5' || github.event.schedule == '7 7 * * 1-5'
         run: |
-          target=$(date -d "12:31" +%s); now=$(date +%s)
+          target=$(date -d "13:32" +%s); now=$(date +%s)
           if [ "$now" -lt "$target" ]; then sleep $((target-now)); fi
 
       - name: Restore today's chart history
@@ -59,11 +65,10 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          if [ "${{ github.event.schedule }}" = "15 3 * * 1-5" ]; then
-            python run_actions.py --until 12:30
-          else
-            python run_actions.py --until 15:42
-          fi
+          case "${{ github.event.schedule }}" in
+            "37 2 * * 1-5"|"7 3 * * 1-5") python run_actions.py --until 13:30 ;;
+            *) python run_actions.py --until 15:42 ;;
+          esac
 
       - name: Save today's chart history
         if: github.event.inputs.mode != 'test' && always()
