@@ -587,7 +587,6 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
         sync = datetime.datetime.now().strftime('%d-%b-%Y  %H:%M:%S')
         fig.suptitle(f"NIFTY EXPIRY  {expiry_label}      @ {sync}  (data {labels[-1]})   |   sync: 3min",
                      fontsize=15, fontweight='bold', fontfamily='monospace', y=0.985)
-        fig.text(0.99, 0.99, '(c) mBOT', fontsize=8, color='#888888', ha='right', va='top')
 
         # Panel 1 : Total OI
         r1 = ax1.twinx(); r1.grid(False)
