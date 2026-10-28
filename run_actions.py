@@ -28,6 +28,7 @@ t.OUTPUT_FILE = os.path.join(HERE, "nifty_oi_tracker.jpg")
 
 def fetch_loop(stop):
     fetcher = nx.Fetcher()
+    stop.wait(nx.POLL_SECONDS - 15)  # pehla data main() me ho chuka, doosra point tab (09:27 do baar na aaye)
     while not stop.is_set():
         try:
             df, expiry = fetcher.snapshot()
@@ -51,6 +52,10 @@ def main():
     a = ap.parse_args()
     h, m = map(int, a.until.split(":"))
     deadline = dt.datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
+
+    if dt.datetime.now() >= deadline:  # backup/late run: is session ka time nikal chuka
+        print("deadline already passed, nothing to do", flush=True)
+        return
 
     stop = threading.Event()
     # pehla data tracker start hone se pehle hi taiyar (handover ke baad alert me deri nahi)
