@@ -17,6 +17,8 @@ if hasattr(time, "tzset"):
 
 import nse_to_excel as nx  # noqa: E402
 import nifty_oi_tracker as t  # noqa: E402
+import logging  # noqa: E402
+logging.getLogger("matplotlib").setLevel(logging.WARNING)  # findfont DEBUG spam band
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(HERE, "data", "NIFTY_DATA.xlsx")
@@ -53,6 +55,7 @@ def main():
     h, m = map(int, a.until.split(":"))
     deadline = dt.datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
 
+    print(f"[RUN] now={dt.datetime.now():%Y-%m-%d %H:%M:%S} until={a.until} deadline={deadline:%H:%M:%S}", flush=True)
     if dt.datetime.now() >= deadline:  # backup/late run: is session ka time nikal chuka
         print("deadline already passed, nothing to do", flush=True)
         return
@@ -71,7 +74,7 @@ def main():
     while dt.datetime.now() < deadline:
         time.sleep(15)
     stop.set()
-    print("deadline reached, exiting cleanly", flush=True)
+    print(f"deadline reached ({deadline:%H:%M}), now={dt.datetime.now():%H:%M:%S}, exiting cleanly", flush=True)
 
 
 if __name__ == "__main__":
