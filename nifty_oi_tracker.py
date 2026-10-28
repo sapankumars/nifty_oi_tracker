@@ -198,15 +198,190 @@ def compute_maxpain(ce_oi: dict, pe_oi: dict) -> int:
     return min(pain, key=pain.get)
 
 # -- TELEGRAM ---------------------------------------------------------------
+# ===== PATCH_BIAS_V13 : PCR + OI-flow + price + MaxPain BIAS engine =====
+LOT_SIZE = 65          # Nifty lot size (sirf Cr/L conversion ke liye)
+BIAS_CFG = {
+    "look_min"    : 10.0,   # OI flow window (minute): 5 / 10 / 15 - jo chahiye likho   PATCH_BIAS_WINDOW
+    "max_gap_min" : 25.0,   # isse bada gap (script band tha) to flow skip
+    "w"           : {"flow": 0.25, "pcr_tr": 0.20, "pcr_rel": 0.10, "price": 0.15, "mp": 0.10, "xover": 0.20},   # PATCH_XOVER: PCR vs Underlying (z-score) crossover
+    "ema"         : 0.5,    # smoothing (chhota = zyada smooth)
+    "on"          : 0.25,   # |score| isse upar => BULLISH / BEARISH
+    "off"         : 0.10,   # |score| isse neeche => wapas NEUTRAL (hysteresis)
+    "strong"      : 0.60,   # |score| isse upar => STRONG
+    "min_hist"    : 8,      # itne points ke baad hi z-score
+    "flat_oi_pct" : 0.2,    # OI change avg OI ka itna % se kam => Flat
+    "flat_px"     : 5.0,    # price move itne points se kam => sideways
+    "xo_eps"      : 0.08,   # PATCH_XOVER: PCR-UND farq (z-score/2) isse kam => "flat", jhootha crossover nahi
+}
+LAST_BIAS = {}   # render_chart yahan latest bias rakhta hai, build_caption yahin se padhta hai
+
+def _snap_min(s):
+    t = s.get("excel_updated") or s["timestamp"]
+    return t.timestamp() / 60.0
+
+def _flow_tags(dce, dpe, dpx, oi_avg):
+    """OI change + price direction se buildup tag (premium ka data nahi, isliye ye andaza hai)."""
+    c   = BIAS_CFG
+    thr = oi_avg * c["flat_oi_pct"] / 100.0
+    up, dn = dpx > c["flat_px"], dpx < -c["flat_px"]
+    if dce < -thr:
+        ce = "Short Covering (Bull)" if up else ("Long Unwinding (Bear)" if dn else "Unwinding (Neutral)")
+    elif dce > thr:
+        ce = "Build-up (Mixed)" if up else "Writing (Bear)"
+    else:
+        ce = "Flat"
+    if dpe > thr:
+        pe = "Writing (Bull)" if up else ("Buying (Bear)" if dn else "Writing (Support)")
+    elif dpe < -thr:
+        pe = "Unwinding (Bull)" if up else ("Unwinding (Bear)" if dn else "Unwinding (Neutral)")
+    else:
+        pe = "Flat"
+    return ce, pe
+
+def compute_bias(hist, mp=None):
+    """hist = sirf aaj ke snapshots. Return: ema(list), labels, bars[(i,dCE,dPE)], last{}"""
+    c = BIAS_CFG
+    n = len(hist)
+    out = {"ema": [], "raw": [], "labels": [], "bars": [], "last": {}}
+    if n < 3:
+        return out
+    t   = np.array([_snap_min(s) for s in hist], float)
+    ce  = np.array([s["total_ce_oi"] for s in hist], float)
+    pe  = np.array([s["total_pe_oi"] for s in hist], float)
+    und = np.array([s["underlying"] for s in hist], float)
+    pcr = pe / np.maximum(ce, 1.0)
+
+    def back(i):   # look_min ke sabse nazdeek snapshot (data 3-min ke gap par aata hai)
+        best = None
+        for k in range(i - 1, -1, -1):
+            d = t[i] - t[k]
+            if d > max(c["look_min"] * 1.5, c["look_min"] + 4.0):
+                break
+            if best is None or abs(d - c["look_min"]) < abs(t[i] - t[best] - c["look_min"]):
+                best = k
+        if best is None or t[i] - t[best] < c["look_min"] * 0.5:
+            return None
+        return best if t[i] - t[best] <= c["max_gap_min"] else None
+
+    feats = {k: [None] * n for k in c["w"]}
+    for i in range(n):
+        j = back(i)
+        if j is not None:
+            feats["flow"][i]   = ((pe[i] - pe[j]) - (ce[i] - ce[j])) / ((ce[i] + pe[i]) / 2.0)
+            feats["pcr_tr"][i] = pcr[i] - pcr[j]
+            feats["price"][i]  = und[i] - und[j]
+        feats["pcr_rel"][i] = pcr[i] - pcr[:i + 1].mean()
+        if mp is not None and mp[i] == mp[i]:
+            feats["mp"][i] = float(np.clip((mp[i] - und[i]) / 50.0, -1, 1))
+        # PATCH_XOVER: PCR aur Underlying ko aaj ke din ki apni mean/std se same scale par laao;
+        # PCR-line Underlying-line ke upar => bullish (+), neeche => bearish (-). (sirf ab tak ka data, future nahi)
+        if i + 1 >= c["min_hist"]:
+            sp, su = float(np.std(pcr[:i + 1])), float(np.std(und[:i + 1]))
+            if sp > 1e-12 and su > 1e-12:
+                zp = (pcr[i] - float(np.mean(pcr[:i + 1]))) / sp
+                zu = (und[i] - float(np.mean(und[:i + 1]))) / su
+                feats["xover"][i] = float(np.clip((zp - zu) / 2.0, -1, 1))
+
+    raw = np.zeros(n)
+    for i in range(n):
+        num = den = 0.0
+        for k, w in c["w"].items():
+            v = feats[k][i]
+            if v is None:
+                continue
+            if k in ("mp", "xover"):   # PATCH_XOVER
+                z = v
+            else:
+                hh = [x for x in feats[k][:i + 1] if x is not None]
+                if len(hh) < c["min_hist"]:
+                    continue
+                sd = float(np.std(hh))
+                if sd <= 1e-12:
+                    continue
+                z = float(np.clip(v / sd / 2.0, -1, 1))
+            num += w * z
+            den += w
+        raw[i] = num / den if den else 0.0
+
+    ema = np.zeros(n)
+    lab = [""] * n
+    st  = "NEUTRAL"
+    for i in range(n):
+        ema[i] = raw[i] if i == 0 else c["ema"] * raw[i] + (1 - c["ema"]) * ema[i - 1]
+        e = ema[i]
+        if st == "NEUTRAL":
+            st = "BULLISH" if e > c["on"] else ("BEARISH" if e < -c["on"] else "NEUTRAL")
+        elif st == "BULLISH" and e < c["off"]:
+            st = "NEUTRAL"
+        elif st == "BEARISH" and e > -c["off"]:
+            st = "NEUTRAL"
+        lab[i] = st if st == "NEUTRAL" else (("STRONG " if abs(e) > c["strong"] else "") + st)
+
+    bars, i = [], n - 1          # peeche se non-overlapping 15-min buckets
+    while i > 0:
+        j = back(i)
+        if j is None:
+            i -= 1
+            continue
+        bars.append((i, int(ce[i] - ce[j]), int(pe[i] - pe[j])))
+        i = j
+    bars.reverse()
+
+    j = back(n - 1)
+    if j is None:
+        j = max(0, n - 6)
+    dce, dpe, dpx = int(ce[-1] - ce[j]), int(pe[-1] - pe[j]), float(und[-1] - und[j])
+    ce_tag, pe_tag = _flow_tags(dce, dpe, dpx, (ce[-1] + pe[-1]) / 2.0)
+    xo_now = feats["xover"][-1]
+    xo_tag = "n/a"
+    if xo_now is not None:
+        eps = c["xo_eps"]
+        sides = [0 if v is None or abs(v) <= eps else (1 if v > 0 else -1) for v in feats["xover"]]
+        cur = sides[-1]
+        if cur == 0:
+            xo_tag = "PCR ~ UND (Flat)"
+        else:
+            xo_tag = "PCR > UND (Bull)" if cur > 0 else "PCR < UND (Bear)"
+            earlier = [x for x in sides[:-1] if x != 0]
+            # asli crossover: pichhla stable side ulta tha aur abhi (is snapshot par) naya side bana
+            if earlier and earlier[-1] != cur and (n < 2 or sides[-2] != cur):
+                xo_tag = "CROSSOVER! " + xo_tag
+    out.update(ema=list(ema), raw=list(raw), labels=lab, bars=bars)
+    out["last"] = {"label": lab[-1], "score": float(ema[-1]), "dce": dce, "dpe": dpe,
+                   "dpx": dpx, "ce_tag": ce_tag, "pe_tag": pe_tag, "xo_tag": xo_tag}
+    return out
+
+def _safe_bias(hist, mp):
+    try:
+        return compute_bias(hist, mp)
+    except Exception as e:
+        log.info(f"[BIAS] error: {e}")
+        return {"ema": [], "raw": [], "labels": [], "bars": [], "last": {}}
+
+def _bias_text(pcr):
+    b = LAST_BIAS
+    if b.get("label"):
+        return f' {b["label"]} ({b["score"]:+.2f})'
+    return " BULLISH" if pcr > 1.0 else " BEARISH"      # fallback (history kam ho)
+
+def _bias_extra():
+    b = LAST_BIAS
+    if not b:
+        return ""
+    return (f"Flow {int(BIAS_CFG['look_min'])}m: CE `{b['dce']:+,}` | PE `{b['dpe']:+,}`\n"
+            f"CE: {b['ce_tag']} | PE: {b['pe_tag']}\n"
+            f"X-over: {b.get('xo_tag', 'n/a')}\n")
+
 def build_caption(snap: dict, pcr: float, maxpain: int) -> str:
     diff = snap["total_pe_oi"] - snap["total_ce_oi"]
-    bias = " SUPER BULLISH / CAUTION" if pcr > 1.2 else (" BULLISH" if pcr > 0.8 else " BEARISH")   # PATCH_BIAS_V8
+    bias = _bias_text(pcr)   # PATCH_BIAS_V13   # PATCH_BIAS_V8
     # PATCH_FIXSCALE_V10: caption - har item apni line mein, koi gap nahi (MP = MaxPain)
     return (
         f"CE OI: `{snap['total_ce_oi']:,}`\n"
         f"PE OI: `{snap['total_pe_oi']:,}`\n"
         f"PE-CE: `{diff:,}`\n"
         f"Bias: {bias.strip()}\n"
+        f"{_bias_extra()}"
         f"PCR: `{pcr:.3f}`\n"
         f"MP: `{maxpain:,}`\n"
         f"Spot: `{snap['underlying']:,.2f}`"
@@ -387,6 +562,8 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
     # PATCH_ABC_V7 (B): har snapshot ka apna MaxPain (din bhar badalta hua step line)
     mp     = [_maxpain_fast(s["ce_oi_by_strike"], s["pe_oi_by_strike"]) for s in history]
     mp_val = mp[-1]
+    _bias = _safe_bias(history[ntail:], mp[ntail:])   # PATCH_BIAS_V13
+    LAST_BIAS.clear(); LAST_BIAS.update(_bias["last"])
 
     C_CE, C_PE, C_DF = '#1f4fd8', '#e0201b', '#111111'
     fmt_k = mticker.FuncFormatter(lambda v, _: f'{int(v):,}')
@@ -399,12 +576,13 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
     _lfs = min(9, max(5.5, 400 / n))   # zyada labels ho to font chhota
 
     with plt.style.context('ggplot'):
-        fig = plt.figure(figsize=(15.65, 9.48), dpi=125)
-        gs  = fig.add_gridspec(3, 1, hspace=0.16, top=0.935, bottom=0.085,
+        fig = plt.figure(figsize=(15.65, 12.4), dpi=125)   # PATCH_BIAS_V13: 4 panel
+        gs  = fig.add_gridspec(4, 1, hspace=0.16, top=0.950, bottom=0.075, height_ratios=[1, 1, 1, 0.85],
                                left=0.062, right=0.925)
         ax1 = fig.add_subplot(gs[0])
         ax2 = fig.add_subplot(gs[1], sharex=ax1)
         ax3 = fig.add_subplot(gs[2], sharex=ax1)
+        ax4 = fig.add_subplot(gs[3], sharex=ax1)   # PATCH_BIAS_V13
 
         sync = datetime.datetime.now().strftime('%d-%b-%Y  %H:%M:%S')
         fig.suptitle(f"NIFTY EXPIRY  {expiry_label}      @ {sync}  (data {labels[-1]})   |   sync: 3min",
@@ -461,22 +639,28 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
         _upad = max((_hi - _lo) * 0.15, 5.0)
         r3.set_ylim(_lo - _upad, _hi + _upad)
         # PATCH_FIXSCALE_V10: FIXED scale - upar wala auto-fit override. Tail (pichhla din) scale ko nahi chhedta.
+        # PATCH_PCR_AUTO_V11: PCR axis AUTO-FIT (sirf aaj ke points, bad outlier ignore)
         _pt = np.array(pcr[ntail:], dtype=float)
         if len(_pt) >= 8:
-            _pt = _pt[np.abs(_pt - np.median(_pt)) <= 0.20 * np.median(_pt)]
-        _plo_f, _phi_f = PCR_FIXED_AXIS
+            _med = float(np.median(_pt))
+            _pt = _pt[np.abs(_pt - _med) <= 0.20 * _med]
         if len(_pt):
-            _plo_f = min(_plo_f, math.floor(_pt.min() / 0.05) * 0.05)
-            _phi_f = max(_phi_f, math.ceil(_pt.max() / 0.05) * 0.05)
-        ax3.set_ylim(_plo_f, _phi_f)
-        ax3.yaxis.set_major_locator(mticker.MultipleLocator(0.05))
+            _lo_p, _hi_p = float(_pt.min()), float(_pt.max())
+            _rng_p = max(_hi_p - _lo_p, 0.04)
+            _mid_p = (_hi_p + _lo_p) / 2.0
+            _pad_p = _rng_p * 0.12
+            ax3.set_ylim(_mid_p - _rng_p / 2 - _pad_p, _mid_p + _rng_p / 2 + _pad_p)
+        ax3.yaxis.set_major_locator(mticker.MaxNLocator(nbins=8))
         ax3.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.2f'))
-        _uc  = round(history[ntail]["underlying"] / 50.0) * 50.0
-        _ut  = und[ntail:]
-        _ulo_f = min(_uc - UND_FIXED_HALF, math.floor((min(_ut) - 10) / 50.0) * 50.0)
-        _uhi_f = max(_uc + UND_FIXED_HALF, math.ceil((max(_ut) + 10) / 50.0) * 50.0)
-        r3.set_ylim(_ulo_f, _uhi_f)
-        r3.yaxis.set_major_locator(mticker.MultipleLocator(50))
+        # PATCH_ALL_AUTO_V12: Underlying + MaxPain axis AUTO-FIT (sirf aaj ke points)
+        _vals = [v for v in (list(und[ntail:]) + list(mp[ntail:])) if v == v]
+        if _vals:
+            _vlo, _vhi = float(min(_vals)), float(max(_vals))
+            _vr  = max(_vhi - _vlo, 40.0)
+            _vm  = (_vhi + _vlo) / 2.0
+            _vp  = _vr * 0.12
+            r3.set_ylim(_vm - _vr / 2 - _vp, _vm + _vr / 2 + _vp)
+        r3.yaxis.set_major_locator(mticker.MaxNLocator(nbins=8))
         r3.yaxis.set_major_formatter(fmt_k)
         ax3.legend(handles=[a], loc='upper left', fontsize=10)
         r3.legend(handles=[b, d], loc='upper right', fontsize=10)
@@ -484,14 +668,50 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
                        (f"MAXPAIN     {mp_val:,}", C_PE),
                        (f"UNDERLYING  {und[-1]:,.2f}", C_DF)])
 
+        # PATCH_BIAS_V13: panel 4 = 15-min CE/PE OI change bars + BIAS score
+        r4 = ax4.twinx(); r4.grid(False)
+        _wm = int(BIAS_CFG["look_min"])
+        if _bias["bars"]:
+            _bx = [ntail + b[0] for b in _bias["bars"]]
+            _sp = min([q[0] - p[0] for p, q in zip(_bias["bars"], _bias["bars"][1:])] or [5])
+            _bw = max(0.5, min(1.4, _sp * 0.45))   # window chhota ho to bars overlap na hon
+            ax4.bar([v - _bw / 2 for v in _bx], [b[1] for b in _bias["bars"]], width=_bw,
+                    color=C_CE, alpha=0.85, label=f'CE OI chg {_wm}m')
+            ax4.bar([v + _bw / 2 for v in _bx], [b[2] for b in _bias["bars"]], width=_bw,
+                    color=C_PE, alpha=0.85, label=f'PE OI chg {_wm}m')
+        ax4.axhline(0, color='#6b7a8a', lw=1.0)
+        if _bias["bars"]:   # left/right zero ek hi line par + legend ke liye upar jagah
+            _mx = max([abs(b[1]) for b in _bias["bars"]] + [abs(b[2]) for b in _bias["bars"]] + [1])
+            ax4.set_ylim(-_mx * 1.7, _mx * 1.7)
+        ax4.yaxis.set_major_formatter(fmt_k)
+        _h4 = [m for m in ax4.get_legend_handles_labels()[0]]
+        if _h4:
+            ax4.legend(handles=_h4, loc='upper left', fontsize=10)
+        _e4 = list(_bias["ema"])
+        if _e4:
+            _bxs = [ntail + i for i in range(len(_e4))]
+            d4, = r4.plot(_bxs, _e4, color=C_DF, lw=1.6, ls='--', label='BIAS score')
+            r4.fill_between(_bxs, 0, _e4, where=[e > 0 for e in _e4], color='#1e8e3e', alpha=0.18, lw=0)
+            r4.fill_between(_bxs, 0, _e4, where=[e < 0 for e in _e4], color='#e65100', alpha=0.18, lw=0)
+            r4.set_ylim(-1.05, 1.05)
+            r4.yaxis.set_major_locator(mticker.MultipleLocator(0.5))
+            r4.legend(handles=[d4], loc='upper right', fontsize=10)
+            _bl = _bias["last"]
+            _bc = '#1e8e3e' if 'BULL' in _bl["label"] else ('#e65100' if 'BEAR' in _bl["label"] else '#555555')
+            _endtext(ax4, [(f"BIAS  {_bl['label']}  {_bl['score']:+.2f}", _bc),
+                           (f"CE {_wm}m  {_bl['dce']:+,}", C_CE),
+                           (f"PE {_wm}m  {_bl['dpe']:+,}", C_PE),
+                           (f"CE: {_bl['ce_tag']}", C_CE),
+                           (f"PE: {_bl['pe_tag']}", C_PE)], y0=0.84, gap=0.17)
+
         ax1.set_xlim(x0, x1)
         if ntail > 0:   # PATCH_ABC_V7 (C): naya din shuru hone ki vertical line
-            for _ax in (ax1, ax2, ax3):
+            for _ax in (ax1, ax2, ax3, ax4):
                 _ax.axvline(ntail, color='#6b7a8a', lw=1.0, zorder=1)
-        for ax in (ax1, ax2):
+        for ax in (ax1, ax2, ax3):
             plt.setp(ax.get_xticklabels(), visible=False)
-        ax3.set_xticks(x[::step])
-        ax3.set_xticklabels(labels[::step], rotation=90, fontsize=_lfs)
+        ax4.set_xticks(x[::step])
+        ax4.set_xticklabels(labels[::step], rotation=90, fontsize=_lfs)
 
         fig.savefig(outfile, dpi=125, format='jpeg', facecolor=fig.get_facecolor(),
                     pil_kwargs={'quality': 92, 'optimize': True})
@@ -506,7 +726,7 @@ def is_market_open() -> bool:
     now = datetime.datetime.now()
     if now.weekday() >= 5: return False
     open_t  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
-    close_t = now.replace(hour=15, minute=40, second=0, microsecond=0)   # PATCH_BIAS_V8
+    close_t = now.replace(hour=15, minute=32, second=0, microsecond=0)   # PATCH_BIAS_V8
     return open_t <= now <= close_t
 
 # -- MAIN LOOP --------------------------------------------------------------
