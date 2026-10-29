@@ -543,7 +543,7 @@ def _spike_free(vals, rel=0.15):
     keep[-1] = True
     return v[keep]
 
-BIAS_BAR_SCALE = 1.5   # PATCH_BIAS_V15: background bars ki oonchai ka multiplier (chhote lagein to 1.5 / 2 karo)
+BIAS_BAR_SCALE = 1.0   # PATCH_BIAS_V15: background bars ki oonchai ka multiplier (chhote lagein to 1.5 / 2 karo)
 
 def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
     history = [s for s in history if _is_fresh(s)]   # PATCH_STALE_V9: purana-date data chart se hatao
@@ -652,7 +652,7 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
         r3.set_ylim(_lo - _upad, _hi + _upad)
         # PATCH_FIXSCALE_V10: FIXED scale - upar wala auto-fit override. Tail (pichhla din) scale ko nahi chhedta.
         # PATCH_PCR_AUTO_V11: PCR axis AUTO-FIT (sirf aaj ke points, bad outlier ignore)
-        _pt = _spike_free(pcr[ntail:])   # PATCH_AXIS_V14: trend wala din line ko chart se bahar nahi karega
+        _pt = _spike_free(pcr)   # PATCH_AXIS_V14: trend wala din line ko chart se bahar nahi karega
         if len(_pt):
             _lo_p, _hi_p = float(_pt.min()), float(_pt.max())
             _rng_p = max(_hi_p - _lo_p, 0.04)
@@ -662,7 +662,7 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
         ax3.yaxis.set_major_locator(mticker.MaxNLocator(nbins=8))
         ax3.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.2f'))
         # PATCH_ALL_AUTO_V12: Underlying + MaxPain axis AUTO-FIT (sirf aaj ke points)
-        _vals = [v for v in (list(und[ntail:]) + list(mp[ntail:])) if v == v]
+        _vals = [v for v in (list(und) + list(mp)) if v == v]
         if _vals:
             _vlo, _vhi = float(min(_vals)), float(max(_vals))
             _vr  = max(_vhi - _vlo, 40.0)
