@@ -530,6 +530,21 @@ def _is_fresh(s: dict) -> bool:
 PCR_FIXED_AXIS = (0.90, 1.30)   # PCR axis (neeche, upar)
 UND_FIXED_HALF = 200            # Underlying axis = din ke pehle point ke aas-paas +- itne points
 
+def _spike_free(vals, rel=0.15):
+    """PATCH_AXIS_V14: sirf AKELE bad points ko scale se hatao, genuine trend/move ko nahi
+    (purana +-20%-of-median filter trend wale din line ko chart se bahar kar deta tha).
+    Point tab spike hai jab apne aas-paas ke 5 points ke median se rel% se zyada door ho. Aakhri point hamesha rakha jata hai."""
+    v = np.array(vals, dtype=float)
+    if len(v) < 5:
+        return v
+    pad = np.pad(v, 2, mode='edge')
+    med = np.array([np.median(pad[i:i + 5]) for i in range(len(v))])
+    keep = np.abs(v - med) <= rel * np.maximum(np.abs(med), 1e-9)
+    keep[-1] = True
+    return v[keep]
+
+BIAS_BAR_SCALE = 1.5   # PATCH_BIAS_V15: background bars ki oonchai ka multiplier (chhote lagein to 1.5 / 2 karo)
+
 def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
     history = [s for s in history if _is_fresh(s)]   # PATCH_STALE_V9: purana-date data chart se hatao
     if len(history) < 2:
@@ -576,13 +591,12 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
     _lfs = min(9, max(5.5, 400 / n))   # zyada labels ho to font chhota
 
     with plt.style.context('ggplot'):
-        fig = plt.figure(figsize=(15.65, 12.4), dpi=125)   # PATCH_BIAS_V13: 4 panel
-        gs  = fig.add_gridspec(4, 1, hspace=0.16, top=0.950, bottom=0.075, height_ratios=[1, 1, 1, 0.85],
+        fig = plt.figure(figsize=(15.65, 9.48), dpi=125)   # PATCH_BIAS_V14: original 1956x1185, 3 panel
+        gs  = fig.add_gridspec(3, 1, hspace=0.16, top=0.935, bottom=0.085,
                                left=0.062, right=0.925)
         ax1 = fig.add_subplot(gs[0])
         ax2 = fig.add_subplot(gs[1], sharex=ax1)
         ax3 = fig.add_subplot(gs[2], sharex=ax1)
-        ax4 = fig.add_subplot(gs[3], sharex=ax1)   # PATCH_BIAS_V13
 
         sync = datetime.datetime.now().strftime('%d-%b-%Y  %H:%M:%S')
         fig.suptitle(f"NIFTY EXPIRY  {expiry_label}      @ {sync}  (data {labels[-1]})   |   sync: 3min",
@@ -605,6 +619,7 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
         r2 = ax2.twinx(); r2.grid(False)
         a, = ax2.plot(x, coi_ce, color=C_CE, lw=2.0, label='TOTAL COI CE')
         b, = ax2.plot(x, coi_pe, color=C_PE, lw=2.0, label='TOTAL COI PE')
+        _leg2 = [a, b]   # PATCH_BIAS_V15
         d, = r2.plot(x, diff_coi, color=C_DF, lw=1.5, ls='--', label='DIFF PE-CE')
         r2.axhline(0, color='#6b7a8a', lw=1.0)   # PATCH_ABC_V7 (A): DIFF axis ki zero line
         ax2.yaxis.set_major_formatter(fmt_k); r2.yaxis.set_major_formatter(fmt_k)
@@ -621,9 +636,7 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
         d, = r3.plot(x, und, color=C_DF, lw=1.5, ls='--', label='Underlying')
         # PCR aur Underlying apni apni range mein fit (Sensibull jaisa); PCR ka bad point scale kharab nahi karega
         ax3.yaxis.set_major_locator(mticker.MaxNLocator(nbins=8))
-        _p = np.array(pcr, dtype=float)
-        _pm  = float(np.median(_p))
-        _pk  = _p[np.abs(_p - _pm) <= 0.20 * _pm] if len(_p) >= 8 else _p   # sirf bad outlier point scale se bahar
+        _pk  = _spike_free(pcr)   # PATCH_AXIS_V14: sirf akela bad point scale se bahar
         _plo, _phi = float(_pk.min()), float(_pk.max())
         _ppad = max((_phi - _plo) * 0.15, 0.005)
         ax3.set_ylim(_plo - _ppad, _phi + _ppad)
@@ -639,10 +652,7 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
         r3.set_ylim(_lo - _upad, _hi + _upad)
         # PATCH_FIXSCALE_V10: FIXED scale - upar wala auto-fit override. Tail (pichhla din) scale ko nahi chhedta.
         # PATCH_PCR_AUTO_V11: PCR axis AUTO-FIT (sirf aaj ke points, bad outlier ignore)
-        _pt = np.array(pcr[ntail:], dtype=float)
-        if len(_pt) >= 8:
-            _med = float(np.median(_pt))
-            _pt = _pt[np.abs(_pt - _med) <= 0.20 * _med]
+        _pt = _spike_free(pcr[ntail:])   # PATCH_AXIS_V14: trend wala din line ko chart se bahar nahi karega
         if len(_pt):
             _lo_p, _hi_p = float(_pt.min()), float(_pt.max())
             _rng_p = max(_hi_p - _lo_p, 0.04)
@@ -667,50 +677,47 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
                        (f"MAXPAIN     {mp_val:,}", C_PE),
                        (f"UNDERLYING  {und[-1]:,.2f}", C_DF)])
 
-        # PATCH_BIAS_V13: panel 4 = 15-min CE/PE OI change bars + BIAS score
-        r4 = ax4.twinx(); r4.grid(False)
-        _wm = int(BIAS_CFG["look_min"])
-        if _bias["bars"]:
-            _bx = [ntail + b[0] for b in _bias["bars"]]
-            _sp = min([q[0] - p[0] for p, q in zip(_bias["bars"], _bias["bars"][1:])] or [5])
-            _bw = max(0.5, min(1.4, _sp * 0.45))   # window chhota ho to bars overlap na hon
-            ax4.bar([v - _bw / 2 for v in _bx], [b[1] for b in _bias["bars"]], width=_bw,
-                    color=C_CE, alpha=0.85, label=f'CE OI chg {_wm}m')
-            ax4.bar([v + _bw / 2 for v in _bx], [b[2] for b in _bias["bars"]], width=_bw,
-                    color=C_PE, alpha=0.85, label=f'PE OI chg {_wm}m')
-        ax4.axhline(0, color='#6b7a8a', lw=1.0)
-        if _bias["bars"]:   # left/right zero ek hi line par + legend ke liye upar jagah
-            _mx = max([abs(b[1]) for b in _bias["bars"]] + [abs(b[2]) for b in _bias["bars"]] + [1])
-            ax4.set_ylim(-_mx * 1.7, _mx * 1.7)
-        ax4.yaxis.set_major_formatter(fmt_k)
-        _h4 = [m for m in ax4.get_legend_handles_labels()[0]]
-        if _h4:
-            ax4.legend(handles=_h4, loc='upper left', fontsize=10)
+        # PATCH_BIAS_V15: Sensibull jaisa - CE/PE OI change bars panel 2 (COI) ke BACKGROUND mein,
+        # baseline wahi zero line (DIFF axis ki) jo pehle se hai. Bias line bhi usi zero ke around.
         _e4 = list(_bias["ema"])
-        if _e4:
-            _bxs = [ntail + i for i in range(len(_e4))]
-            d4, = r4.plot(_bxs, _e4, color=C_DF, lw=1.6, ls='--', label='BIAS score')
-            r4.fill_between(_bxs, 0, _e4, where=[e > 0 for e in _e4], color='#1e8e3e', alpha=0.18, lw=0)
-            r4.fill_between(_bxs, 0, _e4, where=[e < 0 for e in _e4], color='#e65100', alpha=0.18, lw=0)
-            r4.set_ylim(-1.05, 1.05)
-            r4.yaxis.set_major_locator(mticker.MultipleLocator(0.5))
-            r4.legend(handles=[d4], loc='upper right', fontsize=10)
+        if _e4 and _bias["last"]:
             _bl = _bias["last"]
+            _wm = int(BIAS_CFG["look_min"])
+            _l2, _r2l = ax2.get_ylim(), r2.get_ylim()
+            ax2.set_ylim(*_l2); r2.set_ylim(*_r2l)          # limits freeze (bars scale na badlein)
+            _k2 = (_l2[1] - _l2[0]) / (_r2l[1] - _r2l[0])    # DIFF-axis units -> left-axis units
+            _z0 = _l2[0] + (0 - _r2l[0]) * _k2               # DIFF axis ka zero, left axis ke coordinates mein
+            _bars = _bias["bars"]
+            _mx = max([abs(b_[1]) for b_ in _bars] + [abs(b_[2]) for b_ in _bars] + [1]) if _bars else 1
+            if _bars:
+                _bx = [ntail + b_[0] for b_ in _bars]
+                _sp = min([q[0] - p_[0] for p_, q in zip(_bars, _bars[1:])] or [5])
+                _bw = max(0.5, min(1.4, _sp * 0.45))
+                ax2.bar([v - _bw / 2 for v in _bx], [b_[1] * BIAS_BAR_SCALE * _k2 for b_ in _bars], bottom=_z0,
+                        width=_bw, color=C_CE, alpha=0.42, lw=0, zorder=1.5)
+                ax2.bar([v + _bw / 2 for v in _bx], [b_[2] * BIAS_BAR_SCALE * _k2 for b_ in _bars], bottom=_z0,
+                        width=_bw, color=C_PE, alpha=0.42, lw=0, zorder=1.5)
+            _bxs = [ntail + i for i in range(len(_e4))]
+            _bln, = ax2.plot(_bxs, [_z0 + e * _mx * BIAS_BAR_SCALE * _k2 for e in _e4],
+                             color='#6a1b9a', lw=1.3, ls=':', zorder=2.5, label='BIAS score')
+            ax2.legend(handles=_leg2 + [_bln], loc='upper left', fontsize=10)
             _bc = '#1e8e3e' if 'BULL' in _bl["label"] else ('#e65100' if 'BEAR' in _bl["label"] else '#555555')
-            _endtext(ax4, [(f"BIAS  {_bl['label']}  {_bl['score']:+.2f}", _bc),
-                           (f"CE {_wm}m  {_bl['dce']:+,}", C_CE),
-                           (f"PE {_wm}m  {_bl['dpe']:+,}", C_PE),
-                           (f"CE: {_bl['ce_tag']}", C_CE),
-                           (f"PE: {_bl['pe_tag']}", C_PE)], y0=0.84, gap=0.17)
+            def _t(y, txt, clr, fs):
+                ax2.text(_XT[0], y, txt, transform=ax2.transAxes, fontsize=fs, fontfamily='monospace',
+                         fontweight='bold', color=clr, va='center', ha='left', zorder=6)
+            _t(0.935, f"BIAS  {_bl['label']}  {_bl['score']:+.2f}", _bc, 12)
+            _t(0.845, f"CE {_wm}m {_bl['dce']:+,}  {_bl['ce_tag']}", C_CE, 8.5)
+            _t(0.765, f"PE {_wm}m {_bl['dpe']:+,}  {_bl['pe_tag']}", C_PE, 8.5)
+            _t(0.685, f"X-over  {_bl.get('xo_tag', 'n/a')}", '#444444', 8.5)
 
         ax1.set_xlim(x0, x1)
         if ntail > 0:   # PATCH_ABC_V7 (C): naya din shuru hone ki vertical line
-            for _ax in (ax1, ax2, ax3, ax4):
+            for _ax in (ax1, ax2, ax3):
                 _ax.axvline(ntail, color='#6b7a8a', lw=1.0, zorder=1)
-        for ax in (ax1, ax2, ax3):
+        for ax in (ax1, ax2):
             plt.setp(ax.get_xticklabels(), visible=False)
-        ax4.set_xticks(x[::step])
-        ax4.set_xticklabels(labels[::step], rotation=90, fontsize=_lfs)
+        ax3.set_xticks(x[::step])
+        ax3.set_xticklabels(labels[::step], rotation=90, fontsize=_lfs)
 
         fig.savefig(outfile, dpi=125, format='jpeg', facecolor=fig.get_facecolor(),
                     pil_kwargs={'quality': 92, 'optimize': True})
