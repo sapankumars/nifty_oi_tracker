@@ -67,6 +67,23 @@ def parse_nse_date(text):
     return dt.datetime.strptime(text, "%d-%b-%Y").date()
 
 
+# [FIX M8] din ki expiry ek baar mil gayi to dobara "bina expiry" wali API call nahi (har fetch par 2 ki jagah 1 call)
+_EXP_CACHE = {}   # {aaj ki date: expiry date}
+
+
+def parse_nse_ts(text):
+    """NSE 'records.timestamp' (jaise '31-Oct-2026 15:30:00') -> datetime, warna None."""
+    if not text:
+        return None
+    t = str(text).strip()
+    for f in ("%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return dt.datetime.strptime(t, f)
+        except ValueError:
+            continue
+    return None
+
+
 def new_session():
     s = requests.Session()
     s.headers.update(HEADERS)
@@ -95,7 +112,12 @@ def candidate_expiries(session, today, forced=None):
     out = []
     if forced:
         out.append(parse_nse_date(forced))
+    cached = _EXP_CACHE.get(today)
+    if cached and cached not in out:
+        out.append(cached)          # [FIX M8] cached expiry sabse pehle, API call bachi
     try:
+        if cached or forced:
+            raise LookupError("expiry already known")   # list wali extra call skip
         j = get_json(session, API)
         future = [d for d in (parse_nse_date(x) for x in j["records"]["expiryDates"]) if d >= today]
         if future:
@@ -118,9 +140,13 @@ def fetch_chain(session, forced_expiry=None):
         try:
             j = get_json(session, API + "&expiry=" + txt)
             if len(j["filtered"]["data"]) > 0:
+                _EXP_CACHE.clear()
+                _EXP_CACHE[today] = d
                 return j, txt
         except Exception as e:  # noqa: BLE001
             last_err = e
+            if _EXP_CACHE.get(today) == d:
+                _EXP_CACHE.clear()   # cached expiry ne data nahi diya -> agli baar list se dobara dhundo
     raise RuntimeError(f"Koi valid expiry ka data nahi mila. Last error: {last_err}")
 
 

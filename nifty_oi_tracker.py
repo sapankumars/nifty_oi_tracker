@@ -69,6 +69,18 @@ MAX_CLR  = '#c62828'
 UND_CLR  = '#1565c0'
 
 # -- READ EXCEL -------------------------------------------------------------
+def _parse_nse_ts(v):
+    """[FIX H1] NSE_Timestamp (col AK=37) -> datetime. 'N/A' / bekar value par None."""
+    if isinstance(v, datetime.datetime):
+        return v
+    t = str(v or "").strip()
+    for f in ("%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(t, f)
+        except ValueError:
+            continue
+    return None
+
 def read_excel_snapshot(excel_path: str) -> dict | None:
     """
     Read current OI data from Excel sheet.
@@ -91,6 +103,7 @@ def read_excel_snapshot(excel_path: str) -> dict | None:
         pe_oi_by_strike = {}
         underlying      = None
         last_updated    = None
+        nse_ts          = None
         expiry          = None
         tot_ce_coi = 0   # PATCH_CHART_V3
         tot_pe_coi = 0
@@ -110,7 +123,8 @@ def read_excel_snapshot(excel_path: str) -> dict | None:
             strike_pe = row[26]   # col AA(27)= PE strikePrice
             pe_oi     = row[24]   # col Y(25) = PE openInterest
             und_val   = row[13]   # col N(14) = underlyingValue
-            updated   = row[35]   # col AJ(36)= LastUpdated
+            updated   = row[35]   # col AJ(36)= LastUpdated (fetch ka waqt)
+            nse_ts_v  = row[36] if len(row) > 36 else None   # col AK(37)= NSE_Timestamp (NSE ka asli data-time)
             exp_date  = row[0]    # col A(1)  = expiryDates
             try:
                 tot_ce_coi += int(row[3] or 0)    # col D  = CE changeinOpenInterest
@@ -136,6 +150,9 @@ def read_excel_snapshot(excel_path: str) -> dict | None:
                     except:
                         last_updated = datetime.datetime.now()
 
+            if nse_ts is None and nse_ts_v:
+                nse_ts = _parse_nse_ts(nse_ts_v)
+
             if exp_date and expiry is None:
                 if isinstance(exp_date, datetime.datetime):
                     expiry = exp_date.strftime("%d-%b-%Y")
@@ -147,6 +164,12 @@ def read_excel_snapshot(excel_path: str) -> dict | None:
         if not ce_oi_by_strike:
             log.info("[EXCEL] X No data found in sheet")
             return None
+
+        # [FIX H1] freshness / dedupe / chart-time sab NSE ke timestamp par. Parse na ho (N/A) to purana tareeka (fetch time).
+        if nse_ts is not None:
+            last_updated = nse_ts
+        else:
+            log.info("[EXCEL] NSE_Timestamp parse nahi hua - LastUpdated (fetch time) use ho raha hai")
 
         total_ce = sum(ce_oi_by_strike.values())
         total_pe = sum(pe_oi_by_strike.values())
@@ -200,8 +223,22 @@ def compute_maxpain(ce_oi: dict, pe_oi: dict) -> int:
 # -- TELEGRAM ---------------------------------------------------------------
 # ===== PATCH_BIAS_V13 : PCR + OI-flow + price + MaxPain BIAS engine =====
 LOT_SIZE = 65          # Nifty lot size (sirf Cr/L conversion ke liye)
+# -- OI ko Cr / L me dikhane ka formatter (sirf display) ----------------------
+def fmt_oi(v, dec=2, trim=False):
+    """Sensibull jaisa: 14.42Cr / 23.04Cr / -72.22L / -1.24L  (v = NSE ke lots; andar lot size se multiply)."""
+    q = float(v) * LOT_SIZE      # aapka LOT_SIZE = 65 (line ~225)
+    a = abs(q)
+    if a >= 1e7:   num, unit = a / 1e7, "Cr"
+    elif a >= 1e5: num, unit = a / 1e5, "L"
+    elif a >= 1e3: num, unit = a / 1e3, "K"
+    else:          num, unit = a, ""
+    txt = f"{num:.{dec}f}" if unit else f"{num:.0f}"
+    if trim and "." in txt:
+        txt = txt.rstrip("0").rstrip(".")
+    return ("-" if q < 0 and float(txt or 0) != 0 else "") + txt + unit
+
 BIAS_CFG = {
-    "look_min"    : 10.0,   # OI flow window (minute): 5 / 10 / 15 - jo chahiye likho   PATCH_BIAS_WINDOW
+    "look_min"    : 10.0,   # OI flow window (minute): 5 / 10 / 15 - bars bhi isi window ke bante hain   PATCH_BIAS_WINDOW
     "max_gap_min" : 25.0,   # isse bada gap (script band tha) to flow skip
     "w"           : {"flow": 0.25, "pcr_tr": 0.20, "pcr_rel": 0.10, "price": 0.15, "mp": 0.10, "xover": 0.20},   # PATCH_XOVER: PCR vs Underlying (z-score) crossover
     "ema"         : 0.5,    # smoothing (chhota = zyada smooth)
@@ -213,6 +250,7 @@ BIAS_CFG = {
     "flat_px"     : 5.0,    # price move itne points se kam => sideways
     "xo_eps"      : 0.08,   # PATCH_XOVER: PCR-UND farq (z-score/2) isse kam => "flat", jhootha crossover nahi
 }
+_WARN = {"holiday_day": None, "stale": False}   # [FIX H1] ek-baar-wali Telegram warnings ka state
 LAST_BIAS = {}   # render_chart yahan latest bias rakhta hai, build_caption yahin se padhta hai
 
 def _snap_min(s):
@@ -317,7 +355,7 @@ def compute_bias(hist, mp=None):
             st = "NEUTRAL"
         lab[i] = st if st == "NEUTRAL" else (("STRONG " if abs(e) > c["strong"] else "") + st)
 
-    bars, i = [], n - 1          # peeche se non-overlapping 15-min buckets
+    bars, i = [], n - 1          # peeche se non-overlapping look_min-minute buckets (abhi 10 min)
     while i > 0:
         j = back(i)
         if j is None:
@@ -364,12 +402,29 @@ def _bias_text(pcr):
         return f' {b["label"]} ({b["score"]:+.2f})'
     return " BULLISH" if pcr > 1.0 else " BEARISH"      # fallback (history kam ho)
 
+def _fmt_tag(tag, side):
+    """Caption me plain 'Unwinding (...)' ko saaf bhasha me: 'Short Unwinding, PUT BUY KARO' (CE side par CALL BUY KARO).
+    Short Covering bhi: 'Short Covering, CALL BUY KARO'. Baaki tags (Long Unwinding, Writing, Build-up...) jaise hain waise. Chart ke andar ka text nahi badlata."""
+    act = 'CALL' if side == 'CE' else 'PUT'
+    if str(tag).startswith("Unwinding"):
+        return f"Short Unwinding, {act} BUY KARO"
+    if str(tag).startswith("Short Covering"):      # short covering = buying; CE side par aata hai => CALL BUY KARO
+        return f"Short Covering, {act} BUY KARO"
+    return tag
+
 def _bias_extra():
     b = LAST_BIAS
     if not b:
         return ""
-    return (f"Flow {int(BIAS_CFG['look_min'])}m: CE `{b['dce']:+,}` | PE `{b['dpe']:+,}`\n"
-            f"CE: {b['ce_tag']} | PE: {b['pe_tag']}\n"
+    # Flow line hata di. Build-up line: BULLISH => sirf CE side, BEARISH => sirf PE side (NEUTRAL => dono)
+    label = str(b.get("label", "")).upper()
+    if "BULL" in label:
+        build = f"CE: {_fmt_tag(b['ce_tag'], 'CE')}"
+    elif "BEAR" in label:
+        build = f"PE: {_fmt_tag(b['pe_tag'], 'PE')}"
+    else:
+        build = f"CE: {_fmt_tag(b['ce_tag'], 'CE')} | PE: {_fmt_tag(b['pe_tag'], 'PE')}"
+    return (f"{build}\n"
             f"X-over: {b.get('xo_tag', 'n/a')}\n")
 
 def build_caption(snap: dict, pcr: float, maxpain: int) -> str:
@@ -377,15 +432,19 @@ def build_caption(snap: dict, pcr: float, maxpain: int) -> str:
     bias = _bias_text(pcr)   # PATCH_BIAS_V13   # PATCH_BIAS_V8
     # PATCH_FIXSCALE_V10: caption - har item apni line mein, koi gap nahi (MP = MaxPain)
     return (
-        f"CE OI: `{snap['total_ce_oi']:,}`\n"
-        f"PE OI: `{snap['total_pe_oi']:,}`\n"
-        f"PE-CE: `{diff:,}`\n"
+        f"DIFF: `{diff:,}`\n"
         f"Bias: {bias.strip()}\n"
         f"{_bias_extra()}"
         f"PCR: `{pcr:.3f}`\n"
         f"MP: `{maxpain:,}`\n"
         f"Spot: `{snap['underlying']:,.2f}`"
     )
+
+def build_alert_caption(snap: dict, pcr: float, maxpain: int):
+    """Caption SIRF tab jab PCR aur Underlying ka CROSSOVER ho; warna None (khali image jaati hai)."""
+    if str(LAST_BIAS.get("xo_tag", "")).startswith("CROSSOVER!"):
+        return build_caption(snap, pcr, maxpain)
+    return None
 
 def send_telegram_photo(image_path: str, caption: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM['bot_token']}/sendPhoto"
@@ -458,19 +517,37 @@ def _hist_path(day):
                         f"oi_history_{day.strftime('%Y%m%d')}.pkl")
 
 def load_history(day):
+    path = _hist_path(day)
     try:
-        with open(_hist_path(day), 'rb') as f:
+        with open(path, 'rb') as f:
             h = pickle.load(f)
         return h if isinstance(h, list) else []
-    except Exception:
+    except FileNotFoundError:
+        return []
+    except Exception as e:   # [FIX H2] corrupt file ab chup-chap nahi - log + side me rakh do
+        log.info(f"[HIST] load error ({os.path.basename(path)}): {e}")
+        try:
+            os.replace(path, path + ".corrupt")
+        except Exception:
+            pass
         return []
 
 def save_history(day, history):
+    """[FIX H2] ATOMIC save: pehle tmp file, fir os.replace - beech me kat bhi jaye to purani pkl salamat."""
+    path = _hist_path(day)
+    tmp  = path + ".tmp"
     try:
-        with open(_hist_path(day), 'wb') as f:
+        with open(tmp, 'wb') as f:
             pickle.dump(history, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
     except Exception as e:
         log.info(f"[HIST] save error: {e}")
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
 
 _XT = [0.705]
 
@@ -581,7 +658,7 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
     LAST_BIAS.clear(); LAST_BIAS.update(_bias["last"])
 
     C_CE, C_PE, C_DF = '#1f4fd8', '#e0201b', '#111111'
-    fmt_k = mticker.FuncFormatter(lambda v, _: f'{int(v):,}')
+    fmt_k = mticker.FuncFormatter(lambda v, _: fmt_oi(v, 2, True) if abs(v) > 1e-9 else '0')   # Sensibull style Cr/L
 
     # lines ka end axes ke 68% pe - baaki 32% mein values (mBOT jaisa)
     x0 = -0.5
@@ -611,9 +688,9 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
         ax1.yaxis.set_major_formatter(fmt_k); r1.yaxis.set_major_formatter(fmt_k)
         ax1.legend(handles=[a, b], loc='upper left', fontsize=10)
         r1.legend(handles=[d], loc='upper right', fontsize=10)
-        _endtext(ax1, [(f"CE OI  {ce_oi[-1]:,}", C_CE),
-                       (f"PE OI  {pe_oi[-1]:,}", C_PE),
-                       (f"PE-CE  {diff_oi[-1]:,}", C_DF)])
+        _endtext(ax1, [(f"CE OI  {fmt_oi(ce_oi[-1])}", C_CE),
+                       (f"PE OI  {fmt_oi(pe_oi[-1])}", C_PE),
+                       (f"PE-CE  {fmt_oi(diff_oi[-1])}", C_DF)])
 
         # Panel 2 : COI
         r2 = ax2.twinx(); r2.grid(False)
@@ -625,9 +702,9 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
         ax2.yaxis.set_major_formatter(fmt_k); r2.yaxis.set_major_formatter(fmt_k)
         ax2.legend(handles=[a, b], loc='upper left', fontsize=10)
         r2.legend(handles=[d], loc='upper right', fontsize=10)
-        _endtext(ax2, [(f"COI CE  {coi_ce[-1]:,}", C_CE),
-                       (f"COI PE  {coi_pe[-1]:,}", C_PE),
-                       (f"PE-CE   {diff_coi[-1]:,}", C_DF)])
+        _endtext(ax2, [(f"COI CE  {fmt_oi(coi_ce[-1])}", C_CE),
+                       (f"COI PE  {fmt_oi(coi_pe[-1])}", C_PE),
+                       (f"PE-CE   {fmt_oi(diff_coi[-1])}", C_DF)])
 
         # Panel 3 : PCR + MaxPain + Underlying
         r3 = ax3.twinx(); r3.grid(False)
@@ -670,7 +747,7 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
             _vp  = _vr * 0.12
             r3.set_ylim(_vm - _vr / 2 - _vp, _vm + _vr / 2 + _vp)
         r3.yaxis.set_major_locator(mticker.MaxNLocator(nbins=8))
-        r3.yaxis.set_major_formatter(fmt_k)
+        r3.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f'{int(v):,}'))   # MaxPain/Underlying = index points, Cr/L nahi
         ax3.legend(handles=[a], loc='upper left', fontsize=10)
         r3.legend(handles=[b, d], loc='upper right', fontsize=10)
         _endtext(ax3, [(f"PCR         {pcr[-1]:.2f}", C_CE),
@@ -694,7 +771,7 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
                 _sp = min([q[0] - p_[0] for p_, q in zip(_bars, _bars[1:])] or [5])
                 _bw = max(0.5, min(1.4, _sp * 0.45))
                 ax2.bar([v - _bw / 2 for v in _bx], [b_[1] * BIAS_BAR_SCALE * _k2 for b_ in _bars], bottom=_z0,
-                        width=_bw, color=C_CE, alpha=0.42, lw=0, zorder=1.5)
+                        width=_bw, color='#1e8e3e', alpha=0.55, lw=0, zorder=1.5)   # CE flow bars ab GREEN (line/text blue hi hain)
                 ax2.bar([v + _bw / 2 for v in _bx], [b_[2] * BIAS_BAR_SCALE * _k2 for b_ in _bars], bottom=_z0,
                         width=_bw, color=C_PE, alpha=0.42, lw=0, zorder=1.5)
             _bxs = [ntail + i for i in range(len(_e4))]
@@ -706,8 +783,8 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
                 ax2.text(_XT[0], y, txt, transform=ax2.transAxes, fontsize=fs, fontfamily='monospace',
                          fontweight='bold', color=clr, va='center', ha='left', zorder=6)
             _t(0.935, f"BIAS  {_bl['label']}  {_bl['score']:+.2f}", _bc, 12)
-            _t(0.845, f"CE {_wm}m {_bl['dce']:+,}  {_bl['ce_tag']}", C_CE, 8.5)
-            _t(0.765, f"PE {_wm}m {_bl['dpe']:+,}  {_bl['pe_tag']}", C_PE, 8.5)
+            _t(0.845, f"CE {_wm}m {('+' if _bl['dce'] > 0 else '') + fmt_oi(_bl['dce'])}  {_bl['ce_tag']}", C_CE, 8.5)
+            _t(0.765, f"PE {_wm}m {('+' if _bl['dpe'] > 0 else '') + fmt_oi(_bl['dpe'])}  {_bl['pe_tag']}", C_PE, 8.5)
             _t(0.685, f"X-over  {_bl.get('xo_tag', 'n/a')}", '#444444', 8.5)
 
         ax1.set_xlim(x0, x1)
@@ -732,7 +809,7 @@ def is_market_open() -> bool:
     now = datetime.datetime.now()
     if now.weekday() >= 5: return False
     open_t  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
-    close_t = now.replace(hour=15, minute=32, second=0, microsecond=0)   # PATCH_BIAS_V8
+    close_t = now.replace(hour=15, minute=40, second=0, microsecond=0)   # alerts 09:15 se 15:40 tak
     return open_t <= now <= close_t
 
 # -- MAIN LOOP --------------------------------------------------------------
@@ -755,8 +832,10 @@ def main():
         now = datetime.datetime.now()
 
         if not is_market_open():
-            log.info(f"[MAIN] Market closed ({now.strftime('%H:%M')}) - sleeping 60s...")
-            time.sleep(60)
+            # 09:10-09:15 ke beech tez check, taaki pehla alert 09:15 par hi nikle
+            _nap = 10 if (now.weekday() < 5 and now.hour == 9 and 10 <= now.minute < 15) else 60
+            log.info(f"[MAIN] Market closed ({now.strftime('%H:%M')}) - sleeping {_nap}s...")
+            time.sleep(_nap)
             continue
 
         # Fresh graph every new trading session
@@ -767,6 +846,7 @@ def main():
                 send_telegram_text(f" *New trading session*\n`{today}` - Fresh chart started")
             current_session_date = today
             history = load_history(today)
+            _WARN["holiday_day"] = None; _WARN["stale"] = False   # naya din - warnings reset
             last_excel_time = history[-1].get("excel_updated") if history else None
             log.info(f"[MAIN] Session: {today} | History loaded: {len(history)} snapshots")
 
@@ -782,17 +862,24 @@ def main():
         # PATCH_STALE_V9: Excel ka data aaj ka nahi (kal ka purana) to skip, fresh data ka wait
         if excel_t is not None and hasattr(excel_t, "date") and excel_t.date() != today:
             log.info(f"[MAIN] Excel data purana ({excel_t}) - aaj ka data aane tak wait...")
+            # [FIX H1] 09:30 tak bhi aaj ka NSE data nahi -> holiday / NSE issue; din me EK hi baar batao
+            if _WARN["holiday_day"] != today and now.hour * 60 + now.minute >= 9 * 60 + 30:
+                _WARN["holiday_day"] = today
+                send_telegram_text(f"NSE data aaj ({today}) ka nahi aa raha (last data: `{excel_t:%d-%b %H:%M}`).\n"
+                                   "Market holiday ho sakta hai ya NSE access issue. Aaj ka data aate hi chart chalu ho jayega.")
             time.sleep(30)
             continue
-        if excel_t and excel_t == last_excel_time:
-            log.info(f"[MAIN] Excel not yet updated (last: {last_excel_time}) - waiting...")
+        # [FIX H1] ab NSE ke timestamp par: wahi/purana timestamp = naya data nahi aaya (duplicate point nahi banega)
+        if excel_t and last_excel_time and excel_t <= last_excel_time:
+            log.info(f"[MAIN] NSE data abhi naya nahi (last: {last_excel_time}) - waiting...")
             try:
                 _age = (datetime.datetime.now() - excel_t).total_seconds() / 60
-                if _age > 10 and not globals().get('_stale_warned'):
-                    globals()['_stale_warned'] = True
-                    send_telegram_text(f'WARNING: Excel data {_age:.0f} min se update nahi hua (file save nahi ho rahi?)')
+                _live = now.hour * 60 + now.minute <= 15 * 60 + 30     # 15:30 ke baad NSE data band hota hai, warning bekaar
+                if _age > 10 and _live and not _WARN["stale"]:
+                    _WARN["stale"] = True
+                    send_telegram_text(f'WARNING: NSE data {_age:.0f} min se update nahi hua (NSE/fetch issue?)')
                 elif _age <= 10:
-                    globals()['_stale_warned'] = False
+                    _WARN["stale"] = False
             except Exception:
                 pass
             time.sleep(30)
@@ -803,10 +890,19 @@ def main():
         save_history(today, history)
         expiry_label = snap.get("expiry", "N/A")
 
-        pcr_val, mp_val = render_chart(history, expiry_label, OUTPUT_FILE)
-        if pcr_val is not None:
-            caption = build_caption(snap, pcr_val, mp_val)
-            send_telegram_photo(OUTPUT_FILE, caption)
+        # [FIX H3] ek kharab chart/caption poore tracker ko crash na kare; 3 baar lagataar fail ho to Telegram alert
+        try:
+            pcr_val, mp_val = render_chart(history, expiry_label, OUTPUT_FILE)
+            if pcr_val is not None:
+                caption = build_alert_caption(snap, pcr_val, mp_val)   # None => sirf image, crossover par caption
+                send_telegram_photo(OUTPUT_FILE, caption)
+            _WARN["render_fail"] = 0
+        except Exception as e:
+            import traceback
+            _WARN["render_fail"] = _WARN.get("render_fail", 0) + 1
+            log.info(f"[MAIN] chart/send error #{_WARN['render_fail']}: {e}\n{traceback.format_exc()}")
+            if _WARN["render_fail"] == 3:
+                send_telegram_text(f"WARNING: chart 3 baar lagataar fail hua: {e}")
 
         log.info(f"[MAIN] Next read in {POLL_INTERVAL}s...\n")
         time.sleep(POLL_INTERVAL)
@@ -887,4 +983,4 @@ if __name__ == "__main__":
                 "parse_mode": "Markdown"
             }, timeout=10)
         except:
-            pass
+            pass
