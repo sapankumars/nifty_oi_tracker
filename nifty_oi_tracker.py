@@ -620,7 +620,7 @@ def _spike_free(vals, rel=0.15):
     keep[-1] = True
     return v[keep]
 
-BIAS_BAR_SCALE = 1.0   # PATCH_BIAS_V15: background bars ki oonchai ka multiplier (chhote lagein to 1.5 / 2 karo)
+BIAS_BAR_SCALE = 3.0   # PATCH_BIAS_V15: background bars ki oonchai ka multiplier (chhote lagein to 1.5 / 2 karo)
 
 def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
     history = [s for s in history if _is_fresh(s)]   # PATCH_STALE_V9: purana-date data chart se hatao
@@ -983,4 +983,4 @@ if __name__ == "__main__":
                 "parse_mode": "Markdown"
             }, timeout=10)
         except:
-            pass
+            pass
