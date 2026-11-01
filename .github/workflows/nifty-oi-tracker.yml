@@ -8,16 +8,19 @@ on:
         default: "test"
   schedule:
     # GitHub cron UTC me hota hai (IST = UTC + 5:30).
-    # GitHub scheduled runs ko 50-80 min tak late kar raha hai (27-Oct/28-Oct me dekha gaya),
-    # isliye trigger bahut jaldi rakhe hain aur andar "wait" steps hain.
-    # Handover 12:30/12:32 IST par: Session 1 = open se 12:30, Session 2 = 12:32 se close.
-    - cron: "37 1 * * 1-5"   # 07:07 IST  session 1 (09:10 tak wait, 12:30 tak chalta)
-    - cron: "7 2 * * 1-5"    # 07:37 IST  session 1 backup
-    - cron: "37 4 * * 1-5"   # 10:07 IST  session 2 (12:32 par handover, 15:42 tak)
-    - cron: "7 5 * * 1-5"    # 10:37 IST  session 2 backup
+    # Lakshya: alert 09:15 IST se 15:40 IST tak. Job limit 6 ghante hai, isliye 2 session (handover 12:30/12:32):
+    #   Session 1 = open se 12:30 | Session 2 = 12:32 se 15:42
+    # GitHub scheduled runs ko 50-80 min late kar raha hai (27-Oct/28-Oct me dekha gaya), isliye trigger
+    # pehle rakha hai aur andar "wait" steps hain. Trigger ab pehle se ~30 min / ~60 min baad hai
+    # (Actions minutes bachane ke liye). Agar GitHub zyada late kare to in cron ko wapas pehle karo.
+    - cron: "7 2 * * 1-5"    # 07:37 IST  session 1 (09:10 tak wait, 12:30 tak chalta)
+    - cron: "37 2 * * 1-5"   # 08:07 IST  session 1 backup
+    - cron: "37 5 * * 1-5"   # 11:07 IST  session 2 (12:32 par handover, 15:42 tak)
+    - cron: "7 6 * * 1-5"    # 11:37 IST  session 2 backup
 
 concurrency:
-  group: nifty-${{ (github.event.schedule == '37 1 * * 1-5' || github.event.schedule == '7 2 * * 1-5') && 'session1' || 'session2' }}
+  # test mode alag group me (asli session ko kabhi nahi rokta); baaki session1 / session2
+  group: nifty-${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test') && 'test' || ((github.event.schedule == '7 2 * * 1-5' || github.event.schedule == '37 2 * * 1-5') && 'session1' || 'session2') }}
   cancel-in-progress: false
 
 env:
@@ -48,19 +51,20 @@ jobs:
       # ---- RUN MODE ----
       # Session 1 jaldi start hota hai, market open (09:10 IST) tak wait karta hai (STARTED msg open ke aas-paas aaye)
       - name: Wait for market open (09:10 IST) - session 1
-        if: github.event.schedule == '37 1 * * 1-5' || github.event.schedule == '7 2 * * 1-5'
+        if: github.event.schedule == '7 2 * * 1-5' || github.event.schedule == '37 2 * * 1-5'
         run: |
           target=$(date -d "09:10" +%s); now=$(date +%s)
           if [ "$now" -lt "$target" ]; then sleep $((target-now)); fi
 
       # Session 2 jaldi start hoke taiyar baithta hai, session 1 ka history-cache save hone ke baad (12:32) aage badhta hai
       - name: Wait for session 1 handover (12:32 IST)
-        if: github.event.schedule == '37 4 * * 1-5' || github.event.schedule == '7 5 * * 1-5'
+        if: github.event.schedule == '37 5 * * 1-5' || github.event.schedule == '7 6 * * 1-5'
         run: |
           target=$(date -d "12:32" +%s); now=$(date +%s)
           if [ "$now" -lt "$target" ]; then sleep $((target-now)); fi
 
       - name: Restore today's chart history
+        id: restore
         if: github.event.inputs.mode != 'test'
         uses: actions/cache/restore@v4
         with:
@@ -70,6 +74,20 @@ jobs:
             hist-${{ env.D }}-
             hist-
 
+      # Session 2: agar aaj ka cache nahi mila (session 1 ka save abhi ho raha ho) to 45s ruk kar ek baar aur try
+      - name: Handover retry - wait
+        if: github.event.inputs.mode != 'test' && (github.event.schedule == '37 5 * * 1-5' || github.event.schedule == '7 6 * * 1-5') && !startsWith(steps.restore.outputs.cache-matched-key, format('hist-{0}-', env.D))
+        run: sleep 45
+
+      - name: Handover retry - restore
+        if: github.event.inputs.mode != 'test' && (github.event.schedule == '37 5 * * 1-5' || github.event.schedule == '7 6 * * 1-5') && !startsWith(steps.restore.outputs.cache-matched-key, format('hist-{0}-', env.D))
+        uses: actions/cache/restore@v4
+        with:
+          path: oi_history_*.pkl
+          key: hist-${{ env.D }}-${{ github.run_id }}
+          restore-keys: |
+            hist-${{ env.D }}-
+
       - name: Run tracker
         if: github.event.inputs.mode != 'test'
         env:
@@ -77,7 +95,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           case "${{ github.event.schedule }}" in
-            "37 1 * * 1-5"|"7 2 * * 1-5") python run_actions.py --until 12:30 ;;
+            "7 2 * * 1-5"|"37 2 * * 1-5") python run_actions.py --until 12:30 ;;
             *) python run_actions.py --until 15:42 ;;
           esac
 
@@ -85,9 +103,20 @@ jobs:
         if: github.event.inputs.mode != 'test' && always()
         run: ls -1 oi_history_*.pkl 2>/dev/null | sort | head -n -6 | xargs -r rm -f || true
 
+      # Cache sirf tab save hota hai jab tracker asli me chala (backup / late / holiday run ka bekaar cache nahi banta)
       - name: Save today's chart history
-        if: github.event.inputs.mode != 'test' && always()
+        if: github.event.inputs.mode != 'test' && always() && hashFiles('tracker_ran.flag') != ''
         uses: actions/cache/save@v4
         with:
           path: oi_history_*.pkl
           key: hist-${{ env.D }}-${{ github.run_id }}
+
+      # Debug ke liye run ka tracker_log.txt (Actions -> run -> Artifacts)
+      - name: Upload tracker log
+        if: github.event.inputs.mode != 'test' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tracker-log-${{ env.D }}-${{ github.run_id }}
+          path: tracker_log.txt
+          retention-days: 3
+          if-no-files-found: ignore
