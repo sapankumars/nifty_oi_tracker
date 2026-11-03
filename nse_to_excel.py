@@ -150,6 +150,49 @@ def fetch_chain(session, forced_expiry=None):
     raise RuntimeError(f"Koi valid expiry ka data nahi mila. Last error: {last_err}")
 
 
+# --- MONTHLY option chain (mahine ke aakhri expiry ka total CE OI / PE OI) -----------------------
+_MON_CACHE = {}   # {aaj ki date: monthly expiry text} - din me ek baar tay, baar-baar list nahi mangte
+
+
+def monthly_expiry(dates, today):
+    """NSE ki expiry list me se: sabse nazdeek mahina jiski aakhri expiry aaj ya aaj ke baad ki ho -> us mahine ki AAKHRI expiry.
+    (Date NSE ki list se aati hai, isliye holiday ki wajah se aage-peeche hui expiry bhi sahi pakadti hai.)"""
+    last = {}
+    for d in sorted({d for d in dates if d >= today}):
+        last[(d.year, d.month)] = d
+    return last[min(last)] if last else None
+
+
+def chain_totals(j):
+    ce = pe = 0
+    for d in j["filtered"]["data"]:
+        ce += int((d.get("CE") or {}).get("openInterest") or 0)
+        pe += int((d.get("PE") or {}).get("openInterest") or 0)
+    return ce, pe
+
+
+def fetch_monthly(session, j_weekly, weekly_txt):
+    """Monthly expiry ka total CE/PE OI. Weekly aur monthly same expiry ho to extra API call nahi."""
+    today = dt.datetime.now().date()
+    txt = _MON_CACHE.get(today)
+    if txt is None:
+        raw = (j_weekly.get("records") or {}).get("expiryDates") or []
+        if not raw:
+            raw = get_json(session, API)["records"]["expiryDates"]
+        m = monthly_expiry([parse_nse_date(x) for x in raw], today)
+        if m is None:
+            return None
+        txt = m.strftime("%d-%b-%Y")
+        _MON_CACHE.clear()
+        _MON_CACHE[today] = txt
+    jm = j_weekly if txt == weekly_txt else get_json(session, API + "&expiry=" + txt)
+    if not jm["filtered"]["data"]:
+        _MON_CACHE.clear()
+        return None
+    ce, pe = chain_totals(jm)
+    return {"expiry": txt, "ce_oi": ce, "pe_oi": pe, "nse_ts": str((jm.get("records") or {}).get("timestamp", "N/A"))}
+
+
 def build_dataframe(j):
     records = j.get("records", {})
     nse_ts = str(records.get("timestamp", "N/A"))
@@ -173,6 +216,9 @@ def write_excel(df, path=OUT_FILE):
     tmp = path[:-5] + ".tmp.xlsx" if path.endswith(".xlsx") else path + ".tmp.xlsx"
     with pd.ExcelWriter(tmp, engine="openpyxl") as xw:
         df.to_excel(xw, sheet_name="NIFTY DATA", index=False)
+        mon = df.attrs.get("monthly")
+        if mon:   # alag sheet - "NIFTY DATA" ka 37-column layout bilkul waisa hi rehta hai
+            pd.DataFrame([mon], columns=["expiry", "ce_oi", "pe_oi", "nse_ts"]).to_excel(xw, sheet_name="MONTHLY", index=False)
     os.replace(tmp, path)  # half-saved file kabhi nahi dikhegi
 
 
@@ -187,7 +233,13 @@ class Fetcher:
                 if self.session is None or time.time() - self.born > SESSION_MAX_AGE:
                     self.session, self.born = new_session(), time.time()
                 j, expiry = fetch_chain(self.session, self.forced)
-                return build_dataframe(j), expiry
+                df = build_dataframe(j)
+                try:
+                    df.attrs["monthly"] = fetch_monthly(self.session, j, expiry)
+                except Exception as e:  # noqa: BLE001  monthly na aaye to bhi weekly data chalta rahe
+                    df.attrs["monthly"] = None
+                    print(f"monthly fetch error: {e}", flush=True)
+                return df, expiry
             except Exception as e:  # noqa: BLE001
                 err = e
                 self.session = None
@@ -198,8 +250,10 @@ class Fetcher:
 def describe(df, expiry):
     ce, pe = df["openInterest"].sum(), df["openInterest.1"].sum()
     spot = df["underlyingValue"].dropna().iloc[0] if df["underlyingValue"].notna().any() else None
+    mon = df.attrs.get("monthly")
+    mtxt = f" | monthly {mon['expiry']} CE_OI={mon['ce_oi']:,} PE_OI={mon['pe_oi']:,}" if mon else " | monthly n/a"
     return (f"expiry={expiry} strikes={len(df)} spot={spot} CE_OI={int(ce):,} PE_OI={int(pe):,} "
-            f"PCR={pe / ce:.3f}" if ce else f"expiry={expiry} strikes={len(df)} spot={spot}")
+            f"PCR={pe / ce:.3f}{mtxt}" if ce else f"expiry={expiry} strikes={len(df)} spot={spot}{mtxt}")
 
 
 # --- CLI -----------------------------------------------------------------------------------

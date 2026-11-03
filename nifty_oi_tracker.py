@@ -179,7 +179,18 @@ def read_excel_snapshot(excel_path: str) -> dict | None:
               f"CE={total_ce:,} | PE={total_pe:,} | PCR={pcr:.3f} | "
               f"Spot={underlying:,.2f} | Updated={last_updated}")
 
+        # MONTHLY sheet (optional - Power Query wali purani Excel me ye sheet nahi hoti to monthly text bas nahi aata)
+        monthly = None
+        try:
+            if "MONTHLY" in wb.sheetnames:
+                _r = list(wb["MONTHLY"].iter_rows(min_row=2, max_row=2, values_only=True))
+                if _r and _r[0][1] is not None and _r[0][2] is not None:
+                    monthly = {"expiry": str(_r[0][0]), "ce_oi": int(_r[0][1]), "pe_oi": int(_r[0][2])}
+        except Exception as _e:
+            log.info(f"[EXCEL] monthly sheet read error: {_e}")
+
         return {
+            "monthly"         : monthly,
             "timestamp"       : datetime.datetime.now(),
             "excel_updated"   : last_updated,
             "expiry"          : expiry,
@@ -622,7 +633,7 @@ def _spike_free(vals, rel=0.15):
 
 PANEL3_ZSCALE = True   # True = PCR aur Underlying same sigma scale (alert ke crossover jaisa) | False = purana alag-alag auto axis
 
-BIAS_BAR_SCALE = 2.0   # PATCH_BIAS_V15: background bars ki oonchai ka multiplier (chhote lagein to 1.5 / 2 karo)
+BIAS_BAR_SCALE = 1.0   # PATCH_BIAS_V15: background bars ki oonchai ka multiplier (chhote lagein to 1.5 / 2 karo)
 
 def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
     history = [s for s in history if _is_fresh(s)]   # PATCH_STALE_V9: purana-date data chart se hatao
@@ -693,6 +704,16 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
         _endtext(ax1, [(f"CE OI  {fmt_oi(ce_oi[-1])}", C_CE),
                        (f"PE OI  {fmt_oi(pe_oi[-1])}", C_PE),
                        (f"PE-CE  {fmt_oi(diff_oi[-1])}", C_DF)])
+        # MONTHLY expiry ka total CE OI / PE OI / DIFF - panel 1 ke right-top (blue mark wali jagah), chhote letters
+        _mo = history[-1].get("monthly")
+        if _mo:
+            _mce, _mpe = _mo["ce_oi"], _mo["pe_oi"]
+            for _y, _txt, _clr, _fs in [(0.965, f"MONTHLY {_mo['expiry']}", '#555555', 7.5),
+                                        (0.885, f"CE OI  {fmt_oi(_mce)}", C_CE, 10),
+                                        (0.815, f"PE OI  {fmt_oi(_mpe)}", C_PE, 10),
+                                        (0.745, f"DIFF   {fmt_oi(_mpe - _mce)}", C_DF, 10)]:
+                ax1.text(_XT[0], _y, _txt, transform=ax1.transAxes, fontsize=_fs, fontfamily='monospace',
+                         fontweight='bold', color=_clr, va='center', ha='left', zorder=6)
 
         # Panel 2 : COI
         r2 = ax2.twinx(); r2.grid(False)
@@ -1015,4 +1036,4 @@ if __name__ == "__main__":
                 "parse_mode": "Markdown"
             }, timeout=10)
         except:
-            pass
+            pass
