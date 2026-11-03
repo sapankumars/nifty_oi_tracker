@@ -620,7 +620,9 @@ def _spike_free(vals, rel=0.15):
     keep[-1] = True
     return v[keep]
 
-BIAS_BAR_SCALE = 3.0   # PATCH_BIAS_V15: background bars ki oonchai ka multiplier (chhote lagein to 1.5 / 2 karo)
+PANEL3_ZSCALE = True   # True = PCR aur Underlying same sigma scale (alert ke crossover jaisa) | False = purana alag-alag auto axis
+
+BIAS_BAR_SCALE = 2.0   # PATCH_BIAS_V15: background bars ki oonchai ka multiplier (chhote lagein to 1.5 / 2 karo)
 
 def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
     history = [s for s in history if _is_fresh(s)]   # PATCH_STALE_V9: purana-date data chart se hatao
@@ -746,6 +748,38 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
             _vm  = (_vhi + _vlo) / 2.0
             _vp  = _vr * 0.12
             r3.set_ylim(_vm - _vr / 2 - _vp, _vm + _vr / 2 + _vp)
+        # [Z-AXIS] PCR aur Underlying dono axes SAME sigma scale par (+-K sigma, aaj ke data ki mean/std) -
+        # yehi z-score alert ke CROSSOVER me use hota hai, isliye lines chart par wahin cross karengi jahan alert aata hai.
+        # Auto min-max se har din/waqt relative position badal jaati thi. Subah (aaj ke points kam) visible data se.
+        try:
+            if not PANEL3_ZSCALE:
+                raise RuntimeError('PANEL3_ZSCALE=False - auto axis')
+            _nt = n - ntail
+            _sl = slice(ntail, None) if _nt >= BIAS_CFG["min_hist"] else slice(None)
+            _pa = np.array(pcr[_sl], dtype=float)
+            _ua = np.array(und[_sl], dtype=float)
+            _sdp, _sdu = float(np.std(_pa)), float(np.std(_ua))
+            if _sdp > 1e-9 and _sdu > 1e-9:
+                _mup, _muu = float(np.mean(_pa)), float(np.mean(_ua))
+                _zp = (_spike_free(_pa) - _mup) / _sdp
+                _zu = (_ua - _muu) / _sdu
+                _zlo = min(float(_zp.min()), float(_zu.min()))
+                _zhi = max(float(_zp.max()), float(_zu.max()))
+                _sp0 = max(_zhi - _zlo, 0.04 / _sdp, 40.0 / _sdu)      # bahut chhoti range na bane
+                _mid = (_zhi + _zlo) / 2.0
+                _zlo, _zhi = _mid - _sp0 / 2.0, _mid + _sp0 / 2.0
+                # MaxPain sirf tab scale badhaye jab paas ho (door wala MaxPain lines ko dabaye nahi)
+                _zm = [(m - _muu) / _sdu for m in mp[_sl] if m == m]
+                _zm = [z for z in _zm if _zlo - 0.5 * _sp0 <= z <= _zhi + 0.5 * _sp0]
+                if _zm:
+                    _zlo, _zhi = min(_zlo, min(_zm)), max(_zhi, max(_zm))
+                _pd = (_zhi - _zlo) * 0.10
+                _zlo, _zhi = _zlo - _pd, _zhi + _pd
+                ax3.set_ylim(_mup + _zlo * _sdp, _mup + _zhi * _sdp)
+                r3.set_ylim(_muu + _zlo * _sdu, _muu + _zhi * _sdu)
+        except Exception as e:
+            if PANEL3_ZSCALE:
+                log.info(f"[CHART] z-axis error (auto axis par wapas): {e}")
         r3.yaxis.set_major_locator(mticker.MaxNLocator(nbins=8))
         r3.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f'{int(v):,}'))   # MaxPain/Underlying = index points, Cr/L nahi
         ax3.legend(handles=[a], loc='upper left', fontsize=10)
@@ -774,10 +808,8 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
                         width=_bw, color='#1e8e3e', alpha=0.55, lw=0, zorder=1.5)   # CE flow bars ab GREEN (line/text blue hi hain)
                 ax2.bar([v + _bw / 2 for v in _bx], [b_[2] * BIAS_BAR_SCALE * _k2 for b_ in _bars], bottom=_z0,
                         width=_bw, color=C_PE, alpha=0.42, lw=0, zorder=1.5)
-            _bxs = [ntail + i for i in range(len(_e4))]
-            _bln, = ax2.plot(_bxs, [_z0 + e * _mx * BIAS_BAR_SCALE * _k2 for e in _e4],
-                             color='#6a1b9a', lw=1.3, ls=':', zorder=2.5, label='BIAS score')
-            ax2.legend(handles=_leg2 + [_bln], loc='upper left', fontsize=10)
+            # BIAS score wali purple dotted line panel 2 se hata di (bars aur BIAS text waise hi hain)
+            ax2.legend(handles=_leg2, loc='upper left', fontsize=10)
             _bc = '#1e8e3e' if 'BULL' in _bl["label"] else ('#e65100' if 'BEAR' in _bl["label"] else '#555555')
             def _t(y, txt, clr, fs):
                 ax2.text(_XT[0], y, txt, transform=ax2.transAxes, fontsize=fs, fontfamily='monospace',
