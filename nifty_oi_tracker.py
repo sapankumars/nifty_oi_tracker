@@ -771,12 +771,11 @@ def render_chart(history: list, expiry_label: str, outfile: str) -> tuple:
             r3.set_ylim(_vm - _vr / 2 - _vp, _vm + _vr / 2 + _vp)
         # [Z-AXIS] PCR aur Underlying dono axes SAME sigma scale par (+-K sigma, aaj ke data ki mean/std) -
         # yehi z-score alert ke CROSSOVER me use hota hai, isliye lines chart par wahin cross karengi jahan alert aata hai.
-        # Auto min-max se har din/waqt relative position badal jaati thi. Subah (aaj ke points kam) visible data se.
+        # Auto min-max se har din/waqt relative position badal jaati thi.
         try:
             if not PANEL3_ZSCALE:
                 raise RuntimeError('PANEL3_ZSCALE=False - auto axis')
-            _nt = n - ntail
-            _sl = slice(ntail, None) if _nt >= BIAS_CFG["min_hist"] else slice(None)
+            _sl = slice(None)   # hamesha jo chart me dikh raha hai (tail + aaj) usi se scale; sirf-aaj par zoom karne se kal ka hissa gayab ho jata tha
             _pa = np.array(pcr[_sl], dtype=float)
             _ua = np.array(und[_sl], dtype=float)
             _sdp, _sdu = float(np.std(_pa)), float(np.std(_ua))
