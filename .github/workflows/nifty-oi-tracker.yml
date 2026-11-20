@@ -6,21 +6,25 @@ on:
       mode:
         description: "test = sirf NSE access check | run = asli tracker"
         default: "test"
+      until:
+        description: "run mode me: 12:30 (session 1) ya 15:42 (session 2). Khali = schedule se tay hoga"
+        default: ""
   schedule:
     # GitHub cron UTC me hota hai (IST = UTC + 5:30).
-    # Lakshya: alert 09:15 IST se 15:40 IST tak. Job limit 6 ghante hai, isliye 2 session (handover 12:30/12:32):
-    #   Session 1 = open se 12:30 | Session 2 = 12:32 se 15:42
-    # GitHub scheduled runs ko 50-80 min late kar raha hai (27-Oct/28-Oct me dekha gaya), isliye trigger
-    # pehle rakha hai aur andar "wait" steps hain. Trigger ab pehle se ~30 min / ~60 min baad hai
-    # (Actions minutes bachane ke liye). Agar GitHub zyada late kare to in cron ko wapas pehle karo.
-    - cron: "7 2 * * 1-5"    # 07:37 IST  session 1 (09:10 tak wait, 12:30 tak chalta)
+    # NOTE: GitHub scheduled runs 4-9 ghante late ho rahe hain (19-Nov: backup run 21:10 IST par chala).
+    # Isliye asli trigger bahar se aata hai: cron-job.org -> workflow_dispatch API
+    #   09:05 IST -> mode=run, until=12:30   (session 1)
+    #   12:25 IST -> mode=run, until=15:42   (session 2)
+    # Neeche ke cron sirf BACKUP hain (late chale to run_actions 'deadline already passed' bol kar nikal jata hai).
+    - cron: "7 2 * * 1-5"    # 07:37 IST  session 1 backup
     - cron: "37 2 * * 1-5"   # 08:07 IST  session 1 backup
-    - cron: "37 5 * * 1-5"   # 11:07 IST  session 2 (12:32 par handover, 15:42 tak)
+    - cron: "37 5 * * 1-5"   # 11:07 IST  session 2 backup
     - cron: "7 6 * * 1-5"    # 11:37 IST  session 2 backup
 
 concurrency:
-  # test mode alag group me (asli session ko kabhi nahi rokta); baaki session1 / session2
-  group: nifty-${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test') && 'test' || ((github.event.schedule == '7 2 * * 1-5' || github.event.schedule == '37 2 * * 1-5') && 'session1' || 'session2') }}
+  # test mode alag group me (asli session ko kabhi nahi rokta);
+  # dispatch me 'until' se session tay hota hai, schedule me cron se
+  group: nifty-${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test') && 'test' || (github.event.inputs.until == '12:30' && 'session1') || (github.event.inputs.until == '15:42' && 'session2') || ((github.event.schedule == '7 2 * * 1-5' || github.event.schedule == '37 2 * * 1-5') && 'session1' || 'session2') }}
   cancel-in-progress: false
 
 env:
@@ -49,16 +53,16 @@ jobs:
         run: python nse_to_excel.py --test
 
       # ---- RUN MODE ----
-      # Session 1 jaldi start hota hai, market open (09:10 IST) tak wait karta hai (STARTED msg open ke aas-paas aaye)
+      # Session 1: market open (09:10 IST) tak wait (STARTED msg open ke aas-paas aaye)
       - name: Wait for market open (09:10 IST) - session 1
-        if: github.event.schedule == '7 2 * * 1-5' || github.event.schedule == '37 2 * * 1-5'
+        if: github.event.schedule == '7 2 * * 1-5' || github.event.schedule == '37 2 * * 1-5' || (github.event.inputs.mode == 'run' && github.event.inputs.until == '12:30')
         run: |
           target=$(date -d "09:10" +%s); now=$(date +%s)
           if [ "$now" -lt "$target" ]; then sleep $((target-now)); fi
 
-      # Session 2 jaldi start hoke taiyar baithta hai, session 1 ka history-cache save hone ke baad (12:32) aage badhta hai
+      # Session 2: session 1 ka history-cache save hone ke baad (12:32) aage badhta hai
       - name: Wait for session 1 handover (12:32 IST)
-        if: github.event.schedule == '37 5 * * 1-5' || github.event.schedule == '7 6 * * 1-5'
+        if: github.event.schedule == '37 5 * * 1-5' || github.event.schedule == '7 6 * * 1-5' || (github.event.inputs.mode == 'run' && github.event.inputs.until == '15:42')
         run: |
           target=$(date -d "12:32" +%s); now=$(date +%s)
           if [ "$now" -lt "$target" ]; then sleep $((target-now)); fi
@@ -76,11 +80,11 @@ jobs:
 
       # Session 2: agar aaj ka cache nahi mila (session 1 ka save abhi ho raha ho) to 45s ruk kar ek baar aur try
       - name: Handover retry - wait
-        if: github.event.inputs.mode != 'test' && (github.event.schedule == '37 5 * * 1-5' || github.event.schedule == '7 6 * * 1-5') && !startsWith(steps.restore.outputs.cache-matched-key, format('hist-{0}-', env.D))
+        if: github.event.inputs.mode != 'test' && (github.event.schedule == '37 5 * * 1-5' || github.event.schedule == '7 6 * * 1-5' || github.event.inputs.until == '15:42') && !startsWith(steps.restore.outputs.cache-matched-key, format('hist-{0}-', env.D))
         run: sleep 45
 
       - name: Handover retry - restore
-        if: github.event.inputs.mode != 'test' && (github.event.schedule == '37 5 * * 1-5' || github.event.schedule == '7 6 * * 1-5') && !startsWith(steps.restore.outputs.cache-matched-key, format('hist-{0}-', env.D))
+        if: github.event.inputs.mode != 'test' && (github.event.schedule == '37 5 * * 1-5' || github.event.schedule == '7 6 * * 1-5' || github.event.inputs.until == '15:42') && !startsWith(steps.restore.outputs.cache-matched-key, format('hist-{0}-', env.D))
         uses: actions/cache/restore@v4
         with:
           path: oi_history_*.pkl
@@ -94,10 +98,15 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          case "${{ github.event.schedule }}" in
-            "7 2 * * 1-5"|"37 2 * * 1-5") python run_actions.py --until 12:30 ;;
-            *) python run_actions.py --until 15:42 ;;
-          esac
+          U="${{ github.event.inputs.until }}"
+          if [ -n "$U" ]; then
+            python run_actions.py --until "$U"
+          else
+            case "${{ github.event.schedule }}" in
+              "7 2 * * 1-5"|"37 2 * * 1-5") python run_actions.py --until 12:30 ;;
+              *) python run_actions.py --until 15:42 ;;
+            esac
+          fi
 
       - name: Prune old chart history (last 6 din rakho)
         if: github.event.inputs.mode != 'test' && always()
